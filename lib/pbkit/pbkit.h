@@ -88,6 +88,7 @@ uint32_t   *pb_push4(uint32_t *p, DWORD command, DWORD param1, DWORD param2, DWO
 uint32_t   *pb_push4f(uint32_t *p, DWORD command, float param1, float param2, float param3, float param4);
 uint32_t   *pb_push_transposed_matrix(uint32_t *p, DWORD command, float *m);
 void    pb_end(uint32_t *pEnd);    //end a block with this (triggers the data sending to GPU)
+void    pb_align(void);
 
 void    pb_extra_buffers(int n);//requests additional back buffers (default is 0) (call it before pb_init)
 void    pb_size(DWORD size);    //sets push buffer size (default is 512Kb) (call it before pb_init)

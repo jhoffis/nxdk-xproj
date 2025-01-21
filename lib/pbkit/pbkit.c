@@ -112,7 +112,7 @@ static  DWORD           *pb_DmaBuffer8; //points at 32 contiguous bytes (Dma Cha
 static  DWORD           *pb_DmaBuffer2; //points at 32 contiguous bytes (Dma Channel ID 2 buffer)
 static  DWORD           *pb_DmaBuffer7; //points at 32 contiguous bytes (Dma Channel ID 7 buffer)
 
-static  DWORD           pb_Size=512*1024;//push buffer size, must be >64Kb and a power of 2
+static  DWORD           pb_Size=2*512*1024;//push buffer size, must be >64Kb and a power of 2
 static  uint32_t        *pb_Head;   //points at push buffer head
 static  uint32_t        *pb_Tail;   //points at push buffer tail
 static  uint32_t        *pb_Put=NULL;   //where next command+params are to be written
@@ -468,14 +468,14 @@ static void pb_vbl_handler(void)
         {
             pb_set_gamma_ramp(&pb_GammaRamp[index][0][0]);
             pb_GammaRampbReady[index]=0;
-            index=(index+1)%3;
+            index=(index+1)%2;
             pb_GammaRampIdx=index;
         }
 
         VIDEOREG(NV_PGRAPH_INCREMENT)|=NV_PGRAPH_INCREMENT_READ_3D_TRIGGER;
 
         //rotate next back buffer & gamma ramp index
-        next=(next+1)%3;
+        next=(next+1)%2;
         pb_BackBufferNxtVBL=next;
     }
 
@@ -540,7 +540,7 @@ static void pb_subprog(DWORD subprogID, DWORD paramA, DWORD paramB)
             next=pb_BackBufferNxt;
             pb_BackBufferIndex[next]=paramA;
             pb_BackBufferbReady[next]=1;
-            next=(next+1)%3;
+            next=(next+1)%2;
             pb_BackBufferNxt=next;
             break;
 
@@ -2195,6 +2195,20 @@ void pb_end(uint32_t *pEnd)
     }
 }
 
+void pb_align(void) {
+    #define FILLSIZE(x) ((16 + 4 - ((x) & 15)) & 15)
+    uint32_t size = FILLSIZE((uintptr_t)pb_Put);
+
+    // Size will be 0, 4, 8, or 12 bytes on x86 since we're aligned to 4
+    uint32_t mask = (size >> 2) & 3;  // 0,1,2,3 for size 0,4,8,12
+    *((uint32_t*)pb_Put + 0) = 0 & -(mask > 0);  // writes if mask > 0
+    *((uint32_t*)pb_Put + 1) = 0 & -(mask > 1);  // writes if mask > 1
+    *((uint32_t*)pb_Put + 2) = 0 & -(mask > 2);  // writes if mask > 2
+
+    pb_Put = (void*)((uintptr_t)pb_Put + size);
+    #undef FILLSIZE
+}
+
 
 void pb_push_to(DWORD subchannel, uint32_t *p, DWORD command, DWORD nparam)
 {
@@ -2474,12 +2488,12 @@ int pb_finished(void)
     p=pb_push1(p,NV20_TCL_PRIMITIVE_3D_WAIT_MAKESPACE,0); //wait/makespace (obtains null status)
     p=pb_push1(p,NV20_TCL_PRIMITIVE_3D_PARAMETER_A,pb_back_index); //set param=back buffer index to show up
     p=pb_push1(p,NV20_TCL_PRIMITIVE_3D_FIRE_INTERRUPT,PB_FINISHED); //subprogID PB_FINISHED: gets frame ready to show up soon
-//  p=pb_push1(p,NV20_TCL_PRIMITIVE_3D_STALL_PIPELINE,0); //stall gpu pipeline (not sure it's needed in triple buffering technic)
+    p=pb_push1(p,NV20_TCL_PRIMITIVE_3D_STALL_PIPELINE,0); //stall gpu pipeline (not sure it's needed in triple buffering technic)
     pb_end(p);
 
     //insert in push buffer the commands to trigger selection of next back buffer
     //(because previous ones may not have finished yet, so need to use 0x0100 call)
-    pb_back_index=(pb_back_index+1)%3;
+    pb_back_index=(pb_back_index+1)%2;
     pb_target_back_buffer();
 
     return 0;
@@ -3360,7 +3374,7 @@ int pb_init(void)
     Width=vm.width;
     Height=vm.height;
 
-    BackBufferCount=2;          //triple buffering technic!
+    BackBufferCount=1;          //triple buffering technic!
                         //allows dynamic details adjustment
 
     pb_FrameBuffersCount=BackBufferCount+1; //front buffer + back buffers

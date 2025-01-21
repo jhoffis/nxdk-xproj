@@ -4,30 +4,41 @@
 // SPDX-FileCopyrightText: 2015 Matt Borgerson
 // SPDX-FileCopyrightText: 2022 Stefan Schmidt
 // SPDX-FileCopyrightText: 2022 Ryan Wendland
+// SPDX-FileCopyrightText: 2024 Dustin Holden
 
-#include "lwip/def.h"
-#include "lwip/ethip6.h"
-#include "lwip/mem.h"
-#include "lwip/mld6.h"
 #include "lwip/opt.h"
+#include "lwip/def.h"
+#include "lwip/mem.h"
 #include "lwip/pbuf.h"
-#include "lwip/snmp.h"
 #include "lwip/stats.h"
 #include "lwip/sys.h"
+#include "lwip/snmp.h"
+#include "lwip/ethip6.h"
+#include "lwip/mld6.h"
 #include "netif/etharp.h"
 #include "netif/ppp/pppoe.h"
 #include "nvnetdrv.h"
-#include <assert.h>
 #include <xboxkrnl/xboxkrnl.h>
+#include <assert.h>
 
 /* Define those to better describe your network interface. */
-#define IFNAME0     'x'
-#define IFNAME1     'b'
-#define RX_BUFF_CNT (RX_RING_SIZE)
+#define IFNAME0 'x'
+#define IFNAME1 'b'
+#ifndef RX_BUFF_CNT
+#define RX_BUFF_CNT (64)
+#endif
+
 
 #define LINK_SPEED_OF_YOUR_NETIF_IN_BPS 100 * 1000 * 1000 /* 100 Mbps */
 
 static struct netif *g_pnetif;
+
+// DPC for handling TX packets from the lwIP stack
+static KDPC nvnetif_tx_dcp;
+
+// Network packets are queued here before being sent to the NIC driver
+static LIST_ENTRY nvnetif_tx_queue;
+
 /**
  * Helper struct to hold private data used to operate your ethernet interface.
  * Keeping the ethernet address of the MAC in this struct is not necessary
@@ -49,33 +60,42 @@ struct nforceif
 typedef struct
 {
     struct pbuf_custom p;
-    void *buff;
+    uint8_t *buff;
 } rx_pbuf_t;
 
 LWIP_MEMPOOL_DECLARE(RX_POOL, RX_BUFF_CNT, sizeof(rx_pbuf_t), "Zero-copy RX PBUF pool");
-void rx_pbuf_free_callback (struct pbuf *p)
+static void rx_pbuf_free_callback(struct pbuf *p)
 {
+    SYS_ARCH_DECL_PROTECT(old_level);
+
     rx_pbuf_t *rx_pbuf = (rx_pbuf_t *)p;
+
+    SYS_ARCH_PROTECT(old_level);
     nvnetdrv_rx_release(rx_pbuf->buff);
     LWIP_MEMPOOL_FREE(RX_POOL, rx_pbuf);
+    SYS_ARCH_UNPROTECT(old_level);
 }
 
-void rx_callback (void *buffer, uint16_t length)
+// This callback is from the HW IRQ
+static void rx_callback(void *buffer, uint16_t length)
 {
     rx_pbuf_t *rx_pbuf = (rx_pbuf_t *)LWIP_MEMPOOL_ALLOC(RX_POOL);
+    assert(rx_pbuf != NULL);
     LWIP_ASSERT("RX_POOL full\n", rx_pbuf != NULL);
-    rx_pbuf->p.custom_free_function = rx_pbuf_free_callback;
-    rx_pbuf->buff = buffer;
-    struct pbuf *p = pbuf_alloced_custom(PBUF_RAW,
-                                         length + ETH_PAD_SIZE,
-                                         PBUF_REF,
-                                         &rx_pbuf->p,
-                                         buffer - ETH_PAD_SIZE,
-                                         NVNET_RX_BUFF_LEN - ETH_PAD_SIZE);
+    if (rx_pbuf == NULL) return;
 
-    if (g_pnetif->input(p, g_pnetif) != ERR_OK) {
+    rx_pbuf->p.custom_free_function = rx_pbuf_free_callback;
+    rx_pbuf->buff   = buffer;
+
+    struct pbuf* p = pbuf_alloced_custom(PBUF_RAW,
+        length + ETH_PAD_SIZE,
+        PBUF_REF,
+        &rx_pbuf->p,
+        rx_pbuf->buff - ETH_PAD_SIZE,
+        NVNET_RX_BUFF_LEN - ETH_PAD_SIZE);
+
+    if(g_pnetif->input(p, g_pnetif) != ERR_OK) {
         pbuf_free(p);
-        nvnetdrv_rx_release(buffer);
     }
 }
 
@@ -88,11 +108,17 @@ void rx_callback (void *buffer, uint16_t length)
  * @return ERR_OK if low level initiliazation succeeds
  *         ERR_IF if any failure
  */
-static err_t low_level_init (struct netif *netif)
+static err_t low_level_init(struct netif *netif)
 {
-    if (nvnetdrv_init(RX_BUFF_CNT, rx_callback) < 0) {
+    if (nvnetdrv_init(RX_BUFF_CNT, rx_callback, PBUF_POOL_SIZE) < 0) {
         return ERR_IF;
     }
+
+    // Initialize DPC
+    KeInitializeDpc(&nvnetif_tx_dcp, nvnetif_tx_push, NULL);
+
+    // Initialize TX queue
+    InitializeListHead(&nvnetif_tx_queue);
 
     /* set MAC hardware address length */
     netif->hwaddr_len = ETHARP_HWADDR_LEN;
@@ -113,7 +139,8 @@ static err_t low_level_init (struct netif *netif)
      * All-nodes link-local is handled by default, so we must let the hardware know
      * to allow multicast packets in.
      * Should set mld_mac_filter previously. */
-    if (netif->mld_mac_filter != NULL) {
+    if (netif->mld_mac_filter != NULL)
+    {
         ip6_addr_t ip6_allnodes_ll;
         ip6_addr_set_allnodes_linklocal(&ip6_allnodes_ll);
         netif->mld_mac_filter(netif, &ip6_allnodes_ll, NETIF_ADD_MAC_FILTER);
@@ -130,7 +157,7 @@ static err_t low_level_init (struct netif *netif)
  *
  * @param userdata the pbuf address, supplied by low_level_output
  */
-void tx_pbuf_free_callback (void *userdata)
+void tx_pbuf_free_callback(void *userdata)
 {
     struct pbuf *p = (struct pbuf *)userdata;
     pbuf_free(p);
@@ -152,74 +179,64 @@ void tx_pbuf_free_callback (void *userdata)
  *             dropped because of memory failure (except for the TCP timers).
  */
 
-static err_t low_level_output (struct netif *netif, struct pbuf *p)
+static err_t low_level_output(struct netif *netif, struct pbuf *p)
 {
 #if ETH_PAD_SIZE
     pbuf_header(p, -ETH_PAD_SIZE); /* drop the padding word */
 #endif
 
-    nvnetdrv_descriptor_t descriptors[4];
-    size_t pbufCount = 0;
+    // TODO: Verify if we can support more than 2 pbufs chained. The driver
+    // currently makes assumptions about split descriptors and the number of
+    // pbufs chained.
+    assert(p->len < 4096);
+    assert(pbuf_clen(p) <= 2);
+
+    // Add the pbuf to our transmission queue
     for (struct pbuf *q = p; q != NULL; q = q->next) {
-        assert(p->len < 4096);
-        descriptors[pbufCount].addr = q->payload;
-        descriptors[pbufCount].length = q->len;
-        descriptors[pbufCount].callback = NULL;
+        // Set the completion callback for the last pbuf in the chain
+        if (q->next == NULL)
+            q->Complete = (complete_cb)tx_pbuf_free_callback;
 
-        pbufCount++;
-        if (pbufCount > 4) {
-            return ERR_MEM;
-        }
-
-        const uint32_t addr_start = (uint32_t)q->payload;
-        const uint32_t addr_end = ((uint32_t)q->payload + q->len);
-        if (addr_start >> 12 != addr_end >> 12) {
-            // Buffer crosses a page boundary
-            const uint32_t addr_boundary = (addr_end & 0xFFFFF000);
-            const uint32_t length_a = addr_boundary - addr_start;
-            const uint32_t length_b = addr_end - addr_boundary;
-
-            // Buffer ends right at page boundary, so no problem
-            if (length_b == 0) {
-                continue;
-            }
-
-            // Fixup the descriptor
-            descriptors[pbufCount - 1].length = length_a;
-
-            // Queue another descriptor for the remainder
-            descriptors[pbufCount].addr = (void *)addr_boundary;
-            descriptors[pbufCount].length = length_b;
-            descriptors[pbufCount].callback = NULL;
-
-            pbufCount++;
-            if (pbufCount > 4) {
-                return ERR_MEM;
-            }
-        }
+        // Add the pbuf to the queue
+        InsertTailList(&nvnetif_tx_queue, &q->ListEntry);
     }
-
-    // Last descriptor gets the callback to free the pbufs
-    descriptors[pbufCount - 1].userdata = (void *)p;
-    descriptors[pbufCount - 1].callback = tx_pbuf_free_callback;
-
-    int r = nvnetdrv_acquire_tx_descriptors(pbufCount);
-    if (!r) {
-        return ERR_MEM;
-    }
-
-#if ETH_PAD_SIZE
-    pbuf_header(p, ETH_PAD_SIZE); /* reclaim the padding word */
-#endif
 
     // Increase pbuf refcount so they don't get freed while the NIC requires them
     pbuf_ref(p);
 
-    nvnetdrv_submit_tx_descriptors(descriptors, pbufCount);
-
-    LINK_STATS_INC(link.xmit);
+    // Queue DPC to handle the packet
+    KeInsertQueueDpc(&nvnetif_tx_dcp, NULL, NULL);
 
     return ERR_OK;
+}
+
+/**
+ * This function pushes a packet off the transmisson queue and into the lwIP driver.
+ * Called from the DPC context.
+ *
+ * @param Dpc unused
+ * @param DeferredContext unused
+ * @param SystemArgument1 unused
+ * @param SystemArgument2 unused
+ *
+ * @return VOID
+ */
+void NTAPI nvnetif_tx_push(PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2)
+{
+    LWIP_UNUSED_ARG(Dpc);
+    LWIP_UNUSED_ARG(DeferredContext);
+    LWIP_UNUSED_ARG(SystemArgument1);
+    LWIP_UNUSED_ARG(SystemArgument2);
+
+    while (!IsListEmpty(&nvnetif_tx_queue) && nvnetdrv_tx_ready())
+    {
+        LIST_ENTRY *entry = RemoveHeadList(&nvnetif_tx_queue);
+
+        // TODO: Make sure the network has not been stopped
+
+        // Send the packet to the driver
+        nvnetdrv_tx_transmit((struct pbuf *)CONTAINING_RECORD(entry, struct pbuf, ListEntry));
+    }
 }
 
 /**
@@ -234,7 +251,7 @@ static err_t low_level_output (struct netif *netif, struct pbuf *p)
  *                 ERR_MEM if private data couldn't be allocated
  *                 any other err_t on error
  */
-err_t nvnetif_init (struct netif *netif)
+err_t nvnetif_init(struct netif *netif)
 {
     struct nforceif *nforceif;
 

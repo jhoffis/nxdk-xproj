@@ -83,7 +83,7 @@
  * ATTENTION: this does not work when tcpip_input() is called from
  * interrupt context!
  */
-#define LWIP_TCPIP_CORE_LOCKING_INPUT   1
+#define LWIP_TCPIP_CORE_LOCKING_INPUT   0
 
 /**
  * SYS_LIGHTWEIGHT_PROT==1: enable inter-task protection (and task-vs-interrupt
@@ -178,7 +178,7 @@
  * a fragmented IP packet waits for all fragments to arrive. If not all fragments arrived
  * in this time, the whole packet is discarded.
  */
-#define IP_REASS_MAXAGE                 3
+#define IP_REASS_MAXAGE                 15
 
 /**
  * IP_REASS_MAX_PBUFS: Total maximum amount of pbufs waiting to be reassembled.
@@ -347,6 +347,20 @@
  * Ethernet.
  */
 #define PBUF_LINK_HLEN                  16
+
+// HACK: Extend Pbuf Flags... This will break if lwIP adds more flags in the future.
+// This should be fine for now (and avoids increasing the pbuf struct size)
+#define PBUF_FLAG_IS_DESCRIPTOR_SPLIT    0x40
+
+// Define struct pbuf pointer type
+typedef struct pbuf *pbuf_t;
+
+// Callback complete function typedef
+typedef void (*complete_cb)(struct pbuf *p);
+
+#define LWIP_PBUF_CUSTOM_DATA \
+   LIST_ENTRY  ListEntry; \
+   complete_cb Complete;
 
 /*
    ------------------------------------------------
